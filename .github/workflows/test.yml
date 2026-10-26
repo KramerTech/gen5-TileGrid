@@ -1,0 +1,34 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: gradle/actions/wrapper-validation@v6
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+      - name: Android SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "build-tools;36.0.0" "platforms;android-36" > /dev/null
+
+      # The whole release pipeline (tests, lint, v1 signing, USB bundles), signed with a
+      # throwaway key instead of the release key.
+      - name: Build with a throwaway key
+        run: |
+          export TILEPAD_KEYSTORE=$RUNNER_TEMP/throwaway.jks TILEPAD_STORE_PASSWORD=throwaway
+          export TILEPAD_CERT_PIN_FILE=/nonexistent
+          keytool -genkeypair -keystore "$TILEPAD_KEYSTORE" -alias tilepad -storepass throwaway \
+            -keypass throwaway -dname CN=throwaway -keyalg RSA -keysize 2048 -validity 1
+          sh tools/build_apk.sh
+          python3 tools/build_usb_bundles.py

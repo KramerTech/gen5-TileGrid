@@ -1,0 +1,98 @@
+name: release
+
+# Push a tag v<version> matching versionName in app/build.gradle.kts and version= in
+# tune-service/NEMESIS.data (e.g. v1.0.1) to build, sign and publish a release.
+# An annotated tag's message becomes the release's "Changes" section.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: gradle/actions/wrapper-validation@v6
+
+      - name: Check versions
+        run: |
+          tag=${GITHUB_REF_NAME#v}
+          app=$(sed -n 's/^ *versionName *= *"\(.*\)".*/\1/p' app/build.gradle.kts)
+          pkg=$(sed -n 's/^version=//p' tune-service/NEMESIS.data)
+          [ "$tag" = "$app" ] && [ "$tag" = "$pkg" ] || {
+            echo "::error::tag $tag, versionName $app and NEMESIS.data version $pkg must all match"; exit 1; }
+          [ -f tools/signing-cert.sha256 ] || {
+            echo "::error::tools/signing-cert.sha256 is missing; releases must pin the signing certificate"; exit 1; }
+          # Annotated tag message, if any (a lightweight tag has none).
+          git fetch --no-tags --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          if [ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag ]; then
+            git for-each-ref --format='%(contents:subject)%0a%0a%(contents:body)' "refs/tags/$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.txt"
+          else
+            : > "$RUNNER_TEMP/notes.txt"
+          fi
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Android SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "build-tools;36.0.0" "platforms;android-36" > /dev/null
+
+      - name: Build and sign
+        env:
+          TILEPAD_KEYSTORE_B64: ${{ secrets.TILEPAD_KEYSTORE_B64 }}
+          TILEPAD_STORE_PASSWORD: ${{ secrets.TILEPAD_STORE_PASSWORD }}
+          TILEPAD_KEY_PASSWORD: ${{ secrets.TILEPAD_KEY_PASSWORD }}
+        run: |
+          [ -n "$TILEPAD_KEYSTORE_B64" ] && [ -n "$TILEPAD_STORE_PASSWORD" ] \
+            || { echo "::error::TILEPAD_KEYSTORE_B64 and TILEPAD_STORE_PASSWORD secrets are required"; exit 1; }
+          # The key password defaults to the store password when that secret isn't set.
+          [ -n "$TILEPAD_KEY_PASSWORD" ] || unset TILEPAD_KEY_PASSWORD
+          export TILEPAD_KEYSTORE=$RUNNER_TEMP/key/tilepad.jks
+          mkdir -m 700 "$RUNNER_TEMP/key"
+          trap 'rm -rf "$RUNNER_TEMP/key"' EXIT
+          base64 -d <<< "$TILEPAD_KEYSTORE_B64" > "$TILEPAD_KEYSTORE"
+          sh tools/build_apk.sh
+          python3 tools/build_usb_bundles.py
+          (cd dist && sha256sum * > SHA256SUMS)
+
+      - name: Release notes
+        run: |
+          python3 -I - .github/release-body.md "$RUNNER_TEMP/notes.txt" dist/release-body.md "${GITHUB_REF_NAME#v}" <<'EOF'
+          import sys
+          tmpl, notes, out, version = sys.argv[1:5]
+          changes = open(notes).read().strip()
+          body = open(tmpl).read().replace("@VERSION@", version).replace(
+              "@CHANGES@", f"\n**Changes in this release:**\n\n{changes}\n" if changes else "")
+          open(out, "w").write(body)
+          EOF
+          cat dist/release-body.md
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # Publishing is a separate job so the job holding the signing key never has
+  # write access to the repo.
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mv dist/release-body.md body.md
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --verify-tag --latest \
+            --title "Tilepad ${GITHUB_REF_NAME#v}" --notes-file body.md dist/*

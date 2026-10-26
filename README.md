@@ -125,7 +125,32 @@ python3 tools/build_usb_bundles.py          # → dist/tilepad.zip + Tilepad-{in
 ```
 
 `build_apk.sh` signs with `keystore/tilepad.jks`, whose password is in `keystore/password`. Both
-are gitignored. **Back them up.** Future updates should be signed with the same key.
+are gitignored. **Back them up.** Future updates should be signed with the same key. If
+`tools/signing-cert.sha256` exists, the build fails unless the APK's signing certificate has that
+SHA-256 (`apksigner verify --print-certs dist/Tilepad.apk` prints it).
+
+### Releases
+
+GitHub Actions builds, signs and publishes releases. Bump `versionName` (and `versionCode`) in
+`app/build.gradle.kts` and `version=` in `tune-service/NEMESIS.data`, commit, then push a matching tag:
+
+```sh
+git tag -a v1.0.1 -m "What changed"   # the message becomes the release notes
+git push origin v1.0.1
+```
+
+The [release workflow](.github/workflows/release.yml) checks that the three versions match, runs
+`build_apk.sh` (tests, lint, signing, certificate check) and `build_usb_bundles.py`, and publishes the
+APK, `tilepad.zip`, the three USB bundles and `SHA256SUMS`. The job holding the key can only read the
+repo; a separate job publishes. Every push and pull request runs the same build with a throwaway key.
+
+The key comes from repository secrets:
+
+```sh
+base64 -i keystore/tilepad.jks | gh secret set TILEPAD_KEYSTORE_B64
+gh secret set TILEPAD_STORE_PASSWORD < keystore/password
+# only if the key's password differs from the store's: gh secret set TILEPAD_KEY_PASSWORD
+```
 
 The debug build simulates the vehicle on an emulator (`ranchu`/`goldfish`). Launch it with
 `--ez design_preview true` to get a fake Wi-Fi connection for screenshots.

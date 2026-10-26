@@ -2,6 +2,9 @@
 # Run locally. Does not connect to or modify a vehicle.
 # Signs with keystore/tilepad.jks (password in keystore/password) unless TILEPAD_KEYSTORE
 # and TILEPAD_STORE_PASSWORD are set. Both live outside git (see .gitignore).
+# If tools/signing-cert.sha256 (or $TILEPAD_CERT_PIN_FILE) exists, the APK's signer must
+# match it, so a wrong key fails here instead of producing an APK that won't install over
+# the previous one. CI's throwaway-key test build points TILEPAD_CERT_PIN_FILE elsewhere.
 set -eu
 cd "$(dirname "$0")/.."
 : "${ANDROID_HOME:=${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
@@ -28,4 +31,15 @@ JARSIGNER=jarsigner
     dist/Tilepad-signing.apk "$TILEPAD_KEY_ALIAS"
 "$BT/zipalign" -f 4 dist/Tilepad-signing.apk dist/Tilepad.apk
 rm -f dist/Tilepad-signing.apk
-"$BT/apksigner" verify --min-sdk-version 19 --verbose --print-certs dist/Tilepad.apk
+"$BT/apksigner" verify --min-sdk-version 19 --verbose --print-certs dist/Tilepad.apk > dist/.verify
+cat dist/.verify
+PIN=${TILEPAD_CERT_PIN_FILE:-tools/signing-cert.sha256}
+if [ -f "$PIN" ]; then
+    want=$(tr -d ' \n' < "$PIN")
+    grep -qi "certificate SHA-256 digest: $want\$" dist/.verify || {
+        rm -f dist/.verify dist/Tilepad.apk
+        echo "Signed with the wrong key: expected certificate SHA-256 $want ($PIN)." >&2
+        exit 1
+    }
+fi
+rm -f dist/.verify
