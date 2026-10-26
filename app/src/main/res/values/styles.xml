@@ -1,0 +1,7 @@
+<resources>
+    <!-- Not fullscreen: Hyundai's status bar (clock, connectivity) stays visible. -->
+    <style name="AppTheme" parent="android:style/Theme.Holo.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:colorBackground">@color/bg</item>
+    </style>
+</resources>

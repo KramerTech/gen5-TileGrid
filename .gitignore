@@ -1,0 +1,19 @@
+# Local SDK configuration and build outputs
+local.properties
+.gradle/
+**/build/
+dist/
+.DS_Store
+.idea/
+*.iml
+# Signing material and private environment files
+keystore/
+*.jks
+*.keystore
+*.p12
+*.pem
+.env
+.env.*
+# Generated APKs and vehicle diagnostics
+*.apk
+verification/

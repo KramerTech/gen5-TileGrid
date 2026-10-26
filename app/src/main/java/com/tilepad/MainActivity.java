@@ -1,0 +1,884 @@
+package com.tilepad;
+
+import android.app.Activity;
+import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.ServiceConnection;
+import android.content.SharedPreferences;
+import android.content.pm.ActivityInfo;
+import android.content.pm.FeatureInfo;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
+import android.graphics.drawable.Drawable;
+import android.net.wifi.SupplicantState;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.SystemClock;
+import android.view.Gravity;
+import android.view.KeyEvent;
+import android.view.View;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/** Minimal grid launcher: square tiles, long-press to rearrange, TUNE-hold to open or close. */
+public final class MainActivity extends Activity implements TileGrid.Listener, TileView.EditListener, Sheet.Listener {
+    static final String EXTRA_FROM_KNOB = "from_knob";
+    private static final String NEMESIS_COMPONENT = "com.nemesis.manager/.MainActivity";
+    /** Root-side half of "turn on the Wi-Fi client", shipped in the NEMESIS package. */
+    private static final String WIFI_CLIENT_SCRIPT = "/data/nemesis/apps/tilepad/bin/wifi-client.sh";
+    private static final String WIFI_CLIENT_XML = "/system/etc/permissions/android.hardware.wifi.xml";
+    private static final int KEY_TUNE_UP = keyCode("KEYCODE_TUNE_UP", 223);
+    private static final int KEY_TUNE_DOWN = keyCode("KEYCODE_TUNE_DOWN", 224);
+    private static final int KEY_TUNE_ENTER = keyCode("KEYCODE_TUNE_ENTER", 243);
+
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private Ui ui;
+    private FrameLayout root;
+    private TileGrid grid;
+    private View done;
+    private Sheet sheet;
+    private AddShortcutPage addPage;
+    private SharedPreferences prefs;
+    private List<TileSpec> specs;
+    private TileSupport support;
+    private WifiTile wifiTile;
+    private PreconTile preconTile;
+    private boolean preview, resumed, started, receiverRegistered, connectionReading, enterDown, enterLong;
+    private long resumedAt, enterAt;
+    private int connectionEpoch, sheetKnob = -1;
+    private ConnectionSnapshot connection = ConnectionSnapshot.unknown();
+
+    private PreconditioningService.LocalBinder vehicleService;
+    private boolean vehicleBound;
+    private PreconditioningSnapshot preconditioning = PreconditioningSnapshot.checking();
+    private PreconditioningSnapshot.State lastPreconState;
+    /** The precondition popup, while it is the sheet on screen. */
+    private StatusCard preconCard;
+    private long awaitingStartAt;
+    private boolean stopIssued, startFailed, preconAutoClose;
+
+    private final ServiceConnection vehicleConnection = new ServiceConnection() {
+        @Override public void onServiceConnected(ComponentName name, IBinder binder) {
+            vehicleService = (PreconditioningService.LocalBinder) binder;
+            preconTick.run();
+        }
+        @Override public void onServiceDisconnected(ComponentName name) {
+            vehicleService = null;
+            onPreconditioning(PreconditioningSnapshot.checking());
+        }
+    };
+    private final Runnable preconTick = new Runnable() {
+        @Override public void run() {
+            main.removeCallbacks(this);
+            if (!resumed) return;
+            if (vehicleService != null) onPreconditioning(vehicleService.snapshot());
+            else if (preconCard != null) renderPreconCard();
+            main.postDelayed(this, 1000);
+        }
+    };
+    private final Runnable connectionTick = new Runnable() {
+        @Override public void run() {
+            main.removeCallbacks(this);
+            if (!resumed) return;
+            refreshConnection();
+            main.postDelayed(this, 3000);
+        }
+    };
+    private final BroadcastReceiver wifiChanges = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) { if (resumed) refreshConnection(); }
+    };
+
+    // ---- lifecycle ----
+
+    @Override protected void onCreate(Bundle state) {
+        super.onCreate(state);
+        ui = new Ui(this);
+        preview = PreviewData.enabled(getIntent());
+        support = preview ? TileSupport.all() : TileSupport.of(systemFeatures(), VehicleClientFactory.simulated());
+        prefs = getSharedPreferences("tilepad", MODE_PRIVATE);
+        specs = TileOrder.parse(prefs.getString("tiles", null));
+
+        root = new FrameLayout(this);
+        root.setBackgroundColor(Ui.BG);
+        grid = new TileGrid(this, ui);
+        grid.setListener(this);
+        TileGrid.Scroll scroll = new TileGrid.Scroll(this, grid);
+        // The right inset keeps tiles clear of Hyundai's split-screen handle.
+        scroll.setPadding(ui.dp(24), ui.dp(16), ui.dp(64), ui.dp(16));
+        scroll.setClipToPadding(false);
+        root.addView(scroll, new FrameLayout.LayoutParams(-1, -1));
+
+        done = ui.button("Done", Glyph.Kind.CHECK, Ui.ACCENT, 0xff3a74d9, Ui.TEXT);
+        done.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { grid.setEditing(false); }
+        });
+        FrameLayout.LayoutParams dp = new FrameLayout.LayoutParams(-2, ui.dp(56), Gravity.BOTTOM | Gravity.RIGHT);
+        dp.rightMargin = ui.dp(76);
+        dp.bottomMargin = ui.dp(24);
+        done.setVisibility(View.GONE);
+        root.addView(done, dp);
+
+        sheet = new Sheet(ui, root, this);
+        setContentView(root);
+        rebuildTiles();
+
+        final Context app = getApplicationContext();
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final AppCatalog catalog = AppCatalog.load(app);
+                main.post(new Runnable() { @Override public void run() { onCatalog(catalog); } });
+            }
+        }, "tilepad-catalog").start();
+    }
+
+    @Override protected void onStart() {
+        super.onStart();
+        started = true;
+        // No preconditioning tile (gas car, unit without the EV option): never talk to the vehicle.
+        if (support.precondition) vehicleBound = bindService(new Intent(this, PreconditioningService.class), vehicleConnection, BIND_AUTO_CREATE);
+    }
+
+    @Override protected void onStop() {
+        started = false;
+        if (vehicleBound) { unbindService(vehicleConnection); vehicleBound = false; }
+        vehicleService = null;
+        super.onStop();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        resumed = true;
+        resumedAt = SystemClock.uptimeMillis();
+        if (support.wifi && !support.wifiClient) bindWifiClientOff();
+        else if (support.wifi) {
+            IntentFilter filter = new IntentFilter(WifiManager.WIFI_STATE_CHANGED_ACTION);
+            filter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
+            filter.addAction(WifiManager.RSSI_CHANGED_ACTION);
+            try { registerReceiver(wifiChanges, filter); receiverRegistered = true; }
+            catch (SecurityException e) { receiverRegistered = false; }
+            connectionTick.run();
+        }
+        refreshAvailability();
+        if (support.precondition) preconTick.run();
+    }
+
+    @Override protected void onPause() {
+        resumed = false;
+        connectionEpoch++;
+        main.removeCallbacks(connectionTick);
+        main.removeCallbacks(preconTick);
+        if (receiverRegistered) { unregisterReceiver(wifiChanges); receiverRegistered = false; }
+        super.onPause();
+    }
+
+    @Override protected void onDestroy() {
+        main.removeCallbacksAndMessages(null);
+        super.onDestroy();
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // Holding TUNE again while Tilepad is showing closes it. Android pauses a resumed
+        // activity before onNewIntent, so "started" is the visibility guard here.
+        if (intent.getBooleanExtra(EXTRA_FROM_KNOB, false) && started
+            && SystemClock.uptimeMillis() - resumedAt > 700) finish();
+    }
+
+    @Override public void onBackPressed() {
+        if (sheet.isShowing()) sheet.dismiss();
+        else if (addPage != null) addPage.onBack();
+        else if (grid.isEditing()) grid.setEditing(false);
+        else finish();
+    }
+
+    // ---- tiles ----
+
+    private void rebuildTiles() {
+        wifiTile = null;
+        preconTile = null;
+        List<TileView> views = new ArrayList<>();
+        // Unsupported core tiles stay in the saved order, just not on the grid.
+        for (TileSpec spec : specs) if (support.shows(spec.kind)) views.add(createTile(spec));
+        grid.setTiles(views);
+        refreshAvailability();
+    }
+
+    private TileView createTile(TileSpec spec) {
+        final TileView tile;
+        switch (spec.kind) {
+            case WIFI:
+                tile = wifiTile = new WifiTile(ui, spec, this);
+                if (support.wifiClient) wifiTile.bind(connection);
+                else wifiTile.bindClientOff(wifiClientPending());
+                break;
+            case PRECONDITION:
+                tile = preconTile = new PreconTile(ui, spec, this);
+                preconTile.bind(preconditioning);
+                break;
+            case NEMESIS:
+                tile = TileView.simple(ui, spec, this, TileView.chip(ui, Glyph.Kind.TERMINAL, Ui.PURPLE), 80, "NEMESIS");
+                break;
+            case CAR_HOME:
+                tile = TileView.simple(ui, spec, this, TileView.chip(ui, Glyph.Kind.CAR, Ui.ACCENT), 80, "Car Home");
+                break;
+            case REBOOT:
+                tile = TileView.simple(ui, spec, this, TileView.chip(ui, Glyph.Kind.REBOOT, Ui.RED), 80, "Reboot");
+                break;
+            case ADD: {
+                tile = TileView.simple(ui, spec, this, ui.glyph(Glyph.Kind.PLUS, Ui.MUTED, 56), 56, "Add shortcut");
+                ((TextView) tile.findViewWithTag("label")).setTextColor(Ui.MUTED);
+                break;
+            }
+            default:
+                tile = TileView.simple(ui, spec, this, TileView.appIcon(ui, shortcutIcon(spec)), 80, shortcutLabel(spec));
+        }
+        tile.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { if (!grid.isEditing()) onTileTap(tile); }
+        });
+        tile.setOnLongClickListener(new View.OnLongClickListener() {
+            @Override public boolean onLongClick(View v) {
+                if (sheet.isShowing() || addPage != null) return false;
+                grid.beginDrag(tile);
+                return true;
+            }
+        });
+        return tile;
+    }
+
+    private Set<String> systemFeatures() {
+        Set<String> names = new HashSet<>();
+        FeatureInfo[] features = getPackageManager().getSystemAvailableFeatures();
+        if (features != null) for (FeatureInfo feature : features) if (feature.name != null) names.add(feature.name);
+        return names;
+    }
+
+    private void refreshAvailability() {
+        if (grid == null) return;
+        for (TileView tile : grid.tiles()) {
+            Intent intent = intentFor(tile.spec);
+            tile.setAvailable(intent == null || preview || canStart(intent));
+        }
+    }
+
+    private void onTileTap(TileView tile) {
+        TileSpec spec = tile.spec;
+        switch (spec.kind) {
+            case WIFI:
+                if (!support.wifiClient) { offerWifiClient(); return; }
+                launch(intentFor(spec), titleOf(tile));
+                return;
+            case PRECONDITION: onPreconTap(); return;
+            case REBOOT: confirmReboot(); return;
+            case ADD: openAddPage(); return;
+            default:
+                Intent intent = intentFor(spec);
+                if (intent != null) launch(intent, titleOf(tile));
+        }
+    }
+
+    private Intent intentFor(TileSpec spec) {
+        switch (spec.kind) {
+            case WIFI: return new Intent("android.settings.WIFI_SETTINGS");
+            case NEMESIS: return new Intent(Intent.ACTION_MAIN).setComponent(ComponentName.unflattenFromString(NEMESIS_COMPONENT));
+            case CAR_HOME: return new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME);
+            case SHORTCUT: {
+                ComponentName component = ComponentName.unflattenFromString(spec.component);
+                if (component == null) return null;
+                Intent intent = new Intent(Intent.ACTION_MAIN).setComponent(component);
+                if (spec.launcher) intent.addCategory(Intent.CATEGORY_LAUNCHER);
+                return intent;
+            }
+            default: return null;
+        }
+    }
+
+    private String titleOf(TileView tile) {
+        switch (tile.spec.kind) {
+            case WIFI: return "Wi-Fi settings";
+            case NEMESIS: return "NEMESIS Manager";
+            case CAR_HOME: return "Car Home";
+            default: return shortcutLabel(tile.spec);
+        }
+    }
+
+    private boolean canStart(Intent intent) {
+        ResolveInfo result = getPackageManager().resolveActivity(intent, 0);
+        ActivityInfo info = result == null ? null : result.activityInfo;
+        if (info == null || !info.exported || !info.enabled || !info.applicationInfo.enabled) return false;
+        return info.permission == null
+            || getPackageManager().checkPermission(info.permission, getPackageName()) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void launch(Intent intent, String title) {
+        if (!canStart(intent)) {
+            showMessage(Glyph.Kind.ALERT, Ui.AMBER, "Can't open " + title,
+                "It isn't installed or can't be opened on this head unit.");
+            return;
+        }
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+        try {
+            startActivity(intent);
+            finish();
+        } catch (ActivityNotFoundException | SecurityException e) {
+            showMessage(Glyph.Kind.ALERT, Ui.RED, "Can't open " + title, e.getMessage());
+        }
+    }
+
+    private ComponentName componentOf(TileSpec spec) {
+        return spec.component == null ? null : ComponentName.unflattenFromString(spec.component);
+    }
+
+    private String shortcutLabel(TileSpec spec) {
+        if (spec.label != null) return spec.label;
+        // The activity's own label; the catalog's " · Class" disambiguation is for the picker list.
+        try {
+            ComponentName component = componentOf(spec);
+            CharSequence label = getPackageManager().getActivityInfo(component, 0).loadLabel(getPackageManager());
+            if (label != null && label.toString().trim().length() > 0) return label.toString().trim();
+        } catch (Exception ignored) { }
+        String component = spec.component == null ? "" : spec.component;
+        return component.substring(component.lastIndexOf('.') + 1);
+    }
+
+    private Drawable shortcutIcon(TileSpec spec) {
+        try { return getPackageManager().getActivityIcon(componentOf(spec)); }
+        catch (Exception e) { return null; }
+    }
+
+    private void saveTiles() {
+        prefs.edit().putString("tiles", TileOrder.serialize(specs)).apply();
+    }
+
+    private void onCatalog(AppCatalog catalog) {
+        if (isFinishing()) return;
+        if (addPage != null) addPage.setCatalog(catalog);
+    }
+
+    // ---- grid callbacks ----
+
+    @Override public void onEditingChanged(boolean editing) {
+        done.setVisibility(editing ? View.VISIBLE : View.GONE);
+        if (editing) grid.setKnobIndex(-1);
+    }
+
+    @Override public void onOrderChanged(List<TileView> order) {
+        List<String> ids = new ArrayList<>();
+        for (TileView tile : order) ids.add(tile.spec.id);
+        specs = TileOrder.reorder(specs, ids);
+        saveTiles();
+    }
+
+    @Override public void onRemove(TileView tile) {
+        String name = shortcutLabel(tile.spec);
+        specs = TileOrder.remove(specs, tile.spec.id);
+        saveTiles();
+        rebuildTiles();
+        toast("Removed " + name);
+    }
+
+    @Override public void onRename(final TileView tile) { showRename(tile.spec); }
+
+    // ---- add shortcut ----
+
+    private void openAddPage() {
+        if (addPage != null) return;
+        grid.setEditing(false);
+        addPage = new AddShortcutPage(ui, new AddShortcutPage.Listener() {
+            @Override public void onPick(AppCatalog.Entry entry, boolean launcher) {
+                specs = TileOrder.add(specs, TileSpec.shortcut(entry.key, launcher, null));
+                saveTiles();
+                rebuildTiles();
+                closeAddPage();
+                toast("Added " + entry.label);
+            }
+            @Override public void onClose() { closeAddPage(); }
+            @Override public boolean isAdded(String component) {
+                return TileOrder.find(specs, TileSpec.shortcut(component, false, null).id) != null;
+            }
+        });
+        addPage.setPadding(ui.dp(24), ui.dp(16), ui.dp(64), ui.dp(16));
+        root.addView(addPage, root.indexOfChild(done) + 1, new FrameLayout.LayoutParams(-1, -1));
+    }
+
+    private void closeAddPage() {
+        if (addPage == null) return;
+        root.removeView(addPage);
+        addPage = null;
+    }
+
+    // ---- rename ----
+
+    private void showRename(final TileSpec spec) {
+        final String original = shortcutLabel(spec.withLabel(null));
+        final StringBuilder text = new StringBuilder(shortcutLabel(spec));
+        LinearLayout card = ui.row();
+        card.setPadding(ui.dp(32), ui.dp(26), ui.dp(26), ui.dp(26));
+
+        LinearLayout left = ui.column();
+        left.addView(ui.text("Rename shortcut", 26, Ui.TEXT, true));
+        final TextView field = ui.line(text.toString(), 22, Ui.TEXT, false);
+        field.setGravity(Gravity.CENTER_VERTICAL);
+        field.setPadding(ui.dp(20), 0, ui.dp(20), 0);
+        Ui.background(field, ui.outlined(Ui.SURFACE, 16, 2, Ui.ACCENT));
+        LinearLayout.LayoutParams fp = new LinearLayout.LayoutParams(-1, ui.dp(64));
+        fp.topMargin = ui.dp(20);
+        left.addView(field, fp);
+        TextView hint = ui.text("Original name: " + original + "\nLeave empty to use it.", 15, Ui.MUTED, false);
+        hint.setLineSpacing(0, 1.15f);
+        LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-1, -2);
+        hp.topMargin = ui.dp(12);
+        left.addView(hint, hp);
+        left.addView(new View(this), new LinearLayout.LayoutParams(-1, 0, 1f));
+        LinearLayout buttons = ui.row();
+        final View cancel = ui.button("Cancel", null, Ui.SURFACE, Ui.SURFACE_PRESSED, Ui.TEXT);
+        final View save = ui.button("Save", null, Ui.ACCENT, 0xff3a74d9, Ui.TEXT);
+        buttons.addView(cancel, new LinearLayout.LayoutParams(-2, ui.dp(58)));
+        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(-2, ui.dp(58));
+        sp.leftMargin = ui.dp(14);
+        buttons.addView(save, sp);
+        left.addView(buttons);
+        card.addView(left, new LinearLayout.LayoutParams(0, -1, 1f));
+
+        final Runnable commit = new Runnable() {
+            @Override public void run() {
+                String value = text.toString().trim();
+                specs = TileOrder.rename(specs, spec.id, value.equals(original) ? null : value);
+                saveTiles();
+                sheet.dismiss();
+                rebuildTiles();
+            }
+        };
+        KeyPad keys = new KeyPad(ui, "Save", new KeyPad.Listener() {
+            @Override public void onText(String value) { text.append(value); field.setText(text); }
+            @Override public void onBackspace() {
+                if (text.length() > 0) text.setLength(text.length() - 1);
+                field.setText(text);
+            }
+            @Override public void onClear() { text.setLength(0); field.setText(text); }
+            @Override public void onDone() { commit.run(); }
+        });
+        LinearLayout.LayoutParams kp = new LinearLayout.LayoutParams(ui.dp(560), ui.dp(268));
+        kp.leftMargin = ui.dp(28);
+        card.addView(keys, kp);
+
+        cancel.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) { sheet.dismiss(); } });
+        save.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) { commit.run(); } });
+        sheet.show(card, 0, null);
+        sheet.setTargets(Arrays.asList(cancel, save));
+    }
+
+    // ---- messages and reboot ----
+
+    private void showMessage(Glyph.Kind kind, int color, String title, String body) {
+        StatusCard card = new StatusCard(ui);
+        card.set(kind, color, false, title, body, null);
+        List<View> buttons = card.setActions(new StatusCard.Action("Close", Ui.SURFACE, dismiss()));
+        sheet.show(card, 680, null);
+        sheet.setTargets(buttons);
+    }
+
+    private Runnable dismiss() {
+        return new Runnable() { @Override public void run() { sheet.dismiss(); } };
+    }
+
+    private void confirmReboot() {
+        final StatusCard card = new StatusCard(ui);
+        String body = "The infotainment system restarts right away and is unavailable until it finishes starting up.";
+        if (preconditioning.requested) body += " The preconditioning request will be cancelled first.";
+        card.set(Glyph.Kind.REBOOT, Ui.RED, false, "Reboot head unit?", body, null);
+        List<View> buttons = card.setActions(
+            new StatusCard.Action("Cancel", Ui.SURFACE, dismiss()),
+            new StatusCard.Action("Reboot", Ui.RED, new Runnable() { @Override public void run() { reboot(card); } }));
+        sheet.show(card, 680, null);
+        sheet.setTargets(buttons);
+    }
+
+    private void reboot(final StatusCard card) {
+        card.set(null, Ui.RED, true, "Rebooting…", "Restarting the head unit.", null);
+        sheet.setTargets(card.setActions());
+        final boolean cancelFirst = preconditioning.requested;
+        if (cancelFirst) send(PreconditioningService.STOP);
+        new Thread(new Runnable() {
+            @Override public void run() {
+                // Give the service time to send the cancel sequence before the system goes down.
+                if (cancelFirst) SystemClock.sleep(2500);
+                final RootShell.Result result = RootShell.run("reboot");
+                if (result.code == 0) SystemClock.sleep(15000); // a successful reboot never gets here
+                main.post(new Runnable() { @Override public void run() {
+                    if (isFinishing()) return;
+                    String detail = result.code == 0 ? "The reboot command was accepted, but the head unit is still running."
+                        : (result.output.isEmpty() ? "nemesis exited with code " + result.code : result.output);
+                    card.set(Glyph.Kind.ALERT, Ui.RED, false, "Reboot didn't happen", detail, null);
+                    sheet.setTargets(card.setActions(new StatusCard.Action("Close", Ui.SURFACE, dismiss())));
+                } });
+            }
+        }, "tilepad-reboot").start();
+    }
+
+    // ---- preconditioning ----
+
+    private void send(String action) {
+        startService(new Intent(this, PreconditioningService.class).setAction(action));
+    }
+
+    private void onPreconditioning(PreconditioningSnapshot s) {
+        PreconditioningSnapshot.State previous = lastPreconState;
+        preconditioning = s;
+        lastPreconState = s.state;
+        if (preconTile != null) preconTile.bind(s);
+        if (preconCard != null) renderPreconCard();
+        else if (previous == PreconditioningSnapshot.State.WAITING && s.state != previous
+            && (s.state == PreconditioningSnapshot.State.ACTIVE || s.state == PreconditioningSnapshot.State.ERROR)
+            && !sheet.isShowing() && addPage == null) {
+            // The BMS answered while the popup was closed: pop up the result anyway.
+            showPreconCard(s.state == PreconditioningSnapshot.State.ACTIVE);
+        }
+    }
+
+    private void onPreconTap() {
+        switch (PreconPresenter.tap(preconditioning)) {
+            case START:
+                send(PreconditioningService.START);
+                awaitingStartAt = SystemClock.uptimeMillis();
+                startFailed = false;
+                stopIssued = false;
+                showPreconCard(true);
+                break;
+            case STOP:
+                send(PreconditioningService.STOP);
+                stopIssued = true;
+                showPreconCard(true);
+                break;
+            default:
+                showPreconCard(false);
+        }
+    }
+
+    private void showPreconCard(boolean autoClose) {
+        final StatusCard card = new StatusCard(ui);
+        // Keep the request state across show(): it dismisses any previous sheet first.
+        long awaiting = awaitingStartAt;
+        boolean stopping = stopIssued;
+        sheet.show(card, 720, new Runnable() {
+            @Override public void run() {
+                if (preconCard != card) return;
+                preconCard = null;
+                awaitingStartAt = 0;
+                startFailed = false;
+                stopIssued = false;
+                main.removeCallbacks(closePrecon);
+            }
+        });
+        preconCard = card;
+        awaitingStartAt = awaiting;
+        stopIssued = stopping;
+        preconAutoClose = autoClose;
+        renderPreconCard();
+    }
+
+    private final Runnable closePrecon = new Runnable() {
+        @Override public void run() { if (preconCard != null) sheet.dismiss(); }
+    };
+
+    private void renderPreconCard() {
+        final PreconditioningSnapshot s = preconditioning;
+        StatusCard card = preconCard;
+        if (card == null) return;
+        StatusCard.Action close = new StatusCard.Action("Close", Ui.SURFACE, dismiss());
+        StatusCard.Action cancel = new StatusCard.Action("Cancel request", Ui.RED, stopAction());
+        String elapsed = s.requested || s.state == PreconditioningSnapshot.State.ENDED
+            ? "Elapsed " + s.elapsed() + "  ·  " + s.indicatorLabel() : s.indicatorLabel();
+        boolean autoClose = false;
+
+        // The service answers asynchronously, so the first snapshots after a tap can be stale.
+        if (awaitingStartAt > 0) {
+            if (s.requested || s.state == PreconditioningSnapshot.State.ERROR) awaitingStartAt = 0;
+            else if (SystemClock.uptimeMillis() - awaitingStartAt > 5000) { awaitingStartAt = 0; startFailed = true; }
+        }
+        if (s.requested) startFailed = false;
+        boolean stopping = stopIssued && s.requested && (s.state == PreconditioningSnapshot.State.WAITING
+            || s.state == PreconditioningSnapshot.State.ACTIVE || s.state == PreconditioningSnapshot.State.UNKNOWN
+            || s.state == PreconditioningSnapshot.State.STOPPING);
+
+        List<View> buttons;
+        if (awaitingStartAt > 0) {
+            card.set(null, Ui.ACCENT, true, "Sending request…", "Asking the car to start battery conditioning.", null);
+            buttons = card.setActions(close);
+        } else if (startFailed) {
+            card.set(Glyph.Kind.ALERT, Ui.AMBER, false, "Not started", s.detail, s.indicatorLabel());
+            buttons = card.setActions(close);
+        } else if (stopping || s.state == PreconditioningSnapshot.State.STOPPING) {
+            card.set(null, Ui.MUTED, true, "Turning off",
+                s.state == PreconditioningSnapshot.State.STOPPING ? s.detail : "Releasing the manual request.", elapsed);
+            buttons = card.setActions(close);
+        } else switch (s.state) {
+            case CHECKING:
+                card.set(null, Ui.MUTED, true, "Checking vehicle", s.detail, null);
+                buttons = card.setActions(close);
+                break;
+            case WAITING:
+                card.set(Glyph.Kind.BATTERY_HEAT, Ui.AMBER, true, "Waiting for BMS",
+                    PreconPresenter.withoutPrefix(s.detail, "Waiting for BMS — "), elapsed);
+                buttons = card.setActions(close, cancel);
+                break;
+            case ACTIVE:
+                card.set(Glyph.Kind.CHECK, Ui.GREEN, false, "Preconditioning active", s.detail, elapsed);
+                buttons = card.setActions(close, new StatusCard.Action("Turn off", Ui.RED, stopAction()));
+                autoClose = preconAutoClose;
+                break;
+            case UNAVAILABLE:
+                card.set(Glyph.Kind.ALERT, Ui.AMBER, false, "Unavailable", s.detail, s.indicatorLabel());
+                buttons = card.setActions(close);
+                break;
+            case UNKNOWN:
+                card.set(Glyph.Kind.ALERT, Ui.AMBER, false, "Status unknown", s.detail, elapsed);
+                buttons = s.canStop ? card.setActions(close, cancel) : card.setActions(close);
+                break;
+            case ERROR:
+                card.set(Glyph.Kind.ALERT, Ui.RED, false, s.title(), s.detail, elapsed);
+                buttons = s.canStop ? card.setActions(close, new StatusCard.Action("Stop request", Ui.RED, stopAction()))
+                    : s.canStart ? card.setActions(close, startAction()) : card.setActions(close);
+                break;
+            default: // IDLE, ENDED
+                if (s.indicator == 1) {
+                    card.set(Glyph.Kind.BATTERY_HEAT, Ui.GREEN, false, "Conditioning by the car",
+                        "The car is conditioning the battery on its own, for example ahead of a navigation charging stop. "
+                            + "Tilepad didn't start it, so it doesn't stop it.", s.indicatorLabel());
+                    buttons = card.setActions(close);
+                } else if (stopIssued || s.state == PreconditioningSnapshot.State.ENDED) {
+                    card.set(Glyph.Kind.CHECK, Ui.MUTED, false, "Preconditioning off", s.detail, elapsed);
+                    buttons = s.canStart ? card.setActions(close, startAction()) : card.setActions(close);
+                    autoClose = preconAutoClose && stopIssued;
+                } else if (s.canStart) {
+                    card.set(Glyph.Kind.BATTERY_HEAT, Ui.ACCENT, false, "Ready", s.detail, s.indicatorLabel());
+                    buttons = card.setActions(close, startAction());
+                } else {
+                    card.set(Glyph.Kind.ALERT, Ui.AMBER, false, "Can't start right now", s.detail, s.indicatorLabel());
+                    buttons = card.setActions(close);
+                }
+        }
+        if (!buttons.equals(sheet.targets())) sheet.setTargets(buttons);
+        if (autoClose) {
+            preconAutoClose = false; // only once per popup
+            main.postDelayed(closePrecon, 3000);
+        }
+    }
+
+    private Runnable stopAction() {
+        return new Runnable() { @Override public void run() {
+            main.removeCallbacks(closePrecon);
+            send(PreconditioningService.STOP);
+            stopIssued = true;
+            preconAutoClose = true;
+            renderPreconCard();
+        } };
+    }
+
+    private StatusCard.Action startAction() {
+        return new StatusCard.Action("Start", Ui.ACCENT, new Runnable() { @Override public void run() {
+            main.removeCallbacks(closePrecon);
+            send(PreconditioningService.START);
+            awaitingStartAt = SystemClock.uptimeMillis();
+            startFailed = false;
+            stopIssued = false;
+            preconAutoClose = true;
+            renderPreconCard();
+        } });
+    }
+
+    // ---- Wi-Fi ----
+
+    private void refreshConnection() {
+        if (connectionReading) return;
+        if (preview) { onConnection(PreviewData.connection()); return; }
+        connectionReading = true;
+        final int epoch = connectionEpoch;
+        new Thread(new Runnable() {
+            @Override public void run() {
+                ConnectionSnapshot value;
+                try {
+                    WifiManager manager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                    if (manager == null) value = ConnectionSnapshot.unknown();
+                    else {
+                        WifiInfo info = manager.getConnectionInfo();
+                        value = ConnectionSnapshot.read(manager.isWifiEnabled(),
+                            info != null && info.getSupplicantState() == SupplicantState.COMPLETED,
+                            info == null ? null : info.getSSID(), info == null ? 0 : info.getIpAddress(),
+                            property("service.adb.tcp.port"), property("persist.adb.tcp.port"));
+                        if (info != null) value = value.withLink(WifiManager.calculateSignalLevel(info.getRssi(), 4), info.getLinkSpeed());
+                    }
+                } catch (SecurityException e) { value = ConnectionSnapshot.unknown(); }
+                final ConnectionSnapshot result = value;
+                main.post(new Runnable() { @Override public void run() {
+                    connectionReading = false;
+                    if (!isFinishing() && resumed && epoch == connectionEpoch) onConnection(result);
+                } });
+            }
+        }, "tilepad-wifi").start();
+    }
+
+    // Hotspot-only units: the radio can't join a network until android.hardware.wifi exists.
+    // Android reads features at boot, so the file existing without the feature means "reboot".
+
+    private static boolean wifiClientPending() { return new File(WIFI_CLIENT_XML).exists(); }
+
+    private void bindWifiClientOff() {
+        if (wifiTile != null) wifiTile.bindClientOff(wifiClientPending());
+    }
+
+    private void offerWifiClient() {
+        final StatusCard card = new StatusCard(ui);
+        if (wifiClientPending()) {
+            sheet.show(card, 680, null);
+            askRebootForWifiClient(card, "Wi-Fi client is on",
+                "It starts after the head unit reboots. Then tap Wi-Fi again to join a network.");
+            return;
+        }
+        card.set(Glyph.Kind.WIFI_OFF, Ui.ACCENT, false, "Turn on Wi-Fi?",
+            "This head unit's Wi-Fi only runs the hotspot that wireless CarPlay and Android Auto use, so it "
+                + "can't join a network. Tilepad can turn on the Wi-Fi client, the same switch as HMG Leafia Plus's "
+                + "Wi-Fi client option. It takes effect after a reboot.",
+            "There's one Wi-Fi radio: while it's connected to a network, wireless CarPlay and Android Auto may not connect.");
+        List<View> buttons = card.setActions(
+            new StatusCard.Action("Cancel", Ui.SURFACE, dismiss()),
+            new StatusCard.Action("Turn on", Ui.ACCENT, new Runnable() { @Override public void run() { enableWifiClient(card); } }));
+        sheet.show(card, 680, null);
+        sheet.setTargets(buttons);
+    }
+
+    private void enableWifiClient(final StatusCard card) {
+        card.set(null, Ui.ACCENT, true, "Turning on Wi-Fi…", "Adding the Wi-Fi client feature.", null);
+        sheet.setTargets(card.setActions());
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final RootShell.Result result = RootShell.run("sh " + WIFI_CLIENT_SCRIPT + " enable");
+                main.post(new Runnable() { @Override public void run() {
+                    if (isFinishing()) return;
+                    bindWifiClientOff();
+                    if (result.code == 0 && wifiClientPending()) {
+                        askRebootForWifiClient(card, "Wi-Fi client on", "Reboot the head unit to finish. "
+                            + "Then tap Wi-Fi to join a network.");
+                        return;
+                    }
+                    String detail = result.output.isEmpty() ? "nemesis exited with code " + result.code : result.output;
+                    card.set(Glyph.Kind.ALERT, Ui.RED, false, "Couldn't turn on Wi-Fi", detail, null);
+                    sheet.setTargets(card.setActions(new StatusCard.Action("Close", Ui.SURFACE, dismiss())));
+                } });
+            }
+        }, "tilepad-wifi-client").start();
+    }
+
+    /** Shows the reboot prompt on a card that is already on screen. */
+    private void askRebootForWifiClient(final StatusCard card, String title, String body) {
+        card.set(Glyph.Kind.CHECK, Ui.GREEN, false, title, body, null);
+        List<View> buttons = card.setActions(
+            new StatusCard.Action("Later", Ui.SURFACE, dismiss()),
+            new StatusCard.Action("Reboot", Ui.RED, new Runnable() { @Override public void run() { reboot(card); } }));
+        sheet.setTargets(buttons);
+    }
+
+    private void onConnection(ConnectionSnapshot value) {
+        connection = value;
+        if (wifiTile != null) wifiTile.bind(value);
+    }
+
+    private static String property(String name) {
+        try {
+            Process process = new ProcessBuilder("/system/bin/getprop", name).start();
+            String value;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                value = reader.readLine();
+            }
+            process.waitFor();
+            return value == null ? "" : value;
+        } catch (Exception e) { return ""; }
+    }
+
+    // ---- TUNE knob ----
+
+    @Override public void onSheetChanged() {
+        sheetKnob = -1;
+        for (View v : sheet.targets()) v.setActivated(false);
+    }
+
+    @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        int code = event.getKeyCode();
+        boolean down = event.getAction() == KeyEvent.ACTION_DOWN;
+        if (code == KEY_TUNE_UP || code == KEY_TUNE_DOWN || code == KeyEvent.KEYCODE_DPAD_RIGHT || code == KeyEvent.KEYCODE_DPAD_LEFT) {
+            if (down) knob(code == KEY_TUNE_UP || code == KeyEvent.KEYCODE_DPAD_RIGHT ? 1 : -1);
+            return true;
+        }
+        if (code == KEY_TUNE_ENTER || code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER) {
+            // Short press only: a TUNE hold belongs to the knob service (open/close).
+            if (down) {
+                if (event.getRepeatCount() == 0) { enterDown = true; enterLong = false; enterAt = SystemClock.uptimeMillis(); }
+                else enterLong = true;
+            } else {
+                if (enterDown && !enterLong && SystemClock.uptimeMillis() - enterAt < 800) knobEnter();
+                enterDown = false;
+                enterLong = false;
+            }
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    private void knob(int delta) {
+        if (sheet.isShowing()) {
+            List<View> targets = sheet.targets();
+            boolean[] enabled = new boolean[targets.size()];
+            Arrays.fill(enabled, true);
+            sheetKnob = KnobFocus.next(sheetKnob, delta, enabled);
+            for (int i = 0; i < targets.size(); i++) targets.get(i).setActivated(i == sheetKnob);
+        } else if (addPage != null) {
+            addPage.knob(delta);
+        } else if (!grid.isEditing()) {
+            boolean[] enabled = new boolean[grid.tiles().size()];
+            Arrays.fill(enabled, true);
+            grid.setKnobIndex(KnobFocus.next(grid.knobIndex(), delta, enabled));
+        }
+    }
+
+    private void knobEnter() {
+        if (sheet.isShowing()) {
+            List<View> targets = sheet.targets();
+            if (sheetKnob >= 0 && sheetKnob < targets.size()) targets.get(sheetKnob).performClick();
+            else knob(1);
+        } else if (addPage != null) {
+            addPage.knobEnter();
+        } else if (grid.isEditing()) {
+            grid.setEditing(false);
+        } else {
+            int index = grid.knobIndex();
+            if (index >= 0 && index < grid.tiles().size()) onTileTap(grid.tiles().get(index));
+            else knob(1);
+        }
+    }
+
+    private void toast(String message) { Toast.makeText(this, message, Toast.LENGTH_SHORT).show(); }
+
+    private static int keyCode(String name, int fallback) {
+        int code = KeyEvent.keyCodeFromString(name);
+        return code > 0 ? code : fallback;
+    }
+}

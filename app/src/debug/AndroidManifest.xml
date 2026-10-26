@@ -1,0 +1,6 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Modern-emulator preview only; never merged into the car's release APK. -->
+    <application>
+        <activity android:name=".MainActivity" android:resizeableActivity="true" android:maxAspectRatio="4.0" />
+    </application>
+</manifest>

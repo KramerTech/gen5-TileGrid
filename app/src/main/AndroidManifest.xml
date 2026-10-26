@@ -1,0 +1,31 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Wi-Fi tile: network name, address and signal. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Hyundai's ActivityManager checks GET_TASKS inside finishActivity() on some paths, so an app
+         without it can crash on a plain finish() (seen with NEMESIS Manager's dialogs). Tilepad
+         finishes on Back and on a second TUNE hold. -->
+    <uses-permission android:name="android.permission.GET_TASKS" />
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+        <service android:name=".PreconditioningService" android:exported="false" />
+        <!-- MAIN/LAUNCHER only (no HOME category): Hyundai's launcher remains the home screen. -->
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|locale|uiMode|fontScale|layoutDirection"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:noHistory="true"
+            android:screenOrientation="landscape"
+            android:windowSoftInputMode="stateAlwaysHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
