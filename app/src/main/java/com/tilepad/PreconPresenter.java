@@ -48,13 +48,21 @@ final class PreconPresenter {
     }
 
     /** Small line under the headline. */
-    static String footer(PreconditioningSnapshot s) {
+    /** The tile's detail row: elapsed time while a request runs, else what the state needs said. */
+    static String detail(PreconditioningSnapshot s) {
         if (s.requested) return "Elapsed " + s.elapsed();
         switch (s.state) {
-            case IDLE: case ENDED:
-                if (s.indicator == 1) return "Controlled by the car";
-                return s.canStart ? "Tap to start" : "Tap for details";
+            case IDLE: case ENDED: return s.indicator == 1 ? "Controlled by the car" : "";
             case CHECKING: return "Vehicle services";
+            default: return "";
+        }
+    }
+
+    /** The tile's bottom hint: what a tap does. */
+    static String hint(PreconditioningSnapshot s) {
+        switch (s.state) {
+            case CHECKING: return "";
+            case IDLE: case ENDED: return !s.requested && s.indicator != 1 && s.canStart ? "Tap to start" : "Tap for details";
             default: return "Tap for details";
         }
     }

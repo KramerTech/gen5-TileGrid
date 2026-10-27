@@ -7,8 +7,10 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 /**
- * Information-dense core tiles (Wi-Fi, preconditioning): a glyph and status pill on top,
- * stacked text anchored to the bottom.
+ * Information-dense core tiles (Wi-Fi, preconditioning, ADB), all one layout: a glyph and status
+ * pill on top, then four text rows anchored to the bottom -- caption (what the tile is), headline
+ * (the state: On / Off / network name), detail (IP, port, elapsed time) and meta (a small extra or
+ * a "Tap to…" hint). Every row keeps its height when empty, so the rows line up across tiles.
  */
 abstract class StatusTile extends TileView {
     final Glyph glyph;
@@ -51,8 +53,8 @@ abstract class StatusTile extends TileView {
         headline = ui.line("", 24, Ui.TEXT, true);
         detail = ui.line("", 17, Ui.TEXT, false);
         meta = ui.line("", 14, Ui.MUTED, false);
-        if (captionText != null) addLine(text, caption, 0);
-        addLine(text, headline, captionText != null ? 6 : 0);
+        addLine(text, caption, 0);
+        addLine(text, headline, 6);
         addLine(text, detail, 6);
         addLine(text, meta, 6);
         content.addView(text, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
@@ -74,8 +76,9 @@ abstract class StatusTile extends TileView {
         Ui.background(pillBox, ui.rounded(Ui.alpha(color, 0.14f), 14));
     }
 
+    /** Empty text hides the row but keeps its slot (see the class comment). */
     static void show(TextView view, String text) {
         view.setText(text == null ? "" : text);
-        view.setVisibility(text == null || text.isEmpty() ? GONE : VISIBLE);
+        view.setVisibility(text == null || text.isEmpty() ? INVISIBLE : VISIBLE);
     }
 }

@@ -18,3 +18,10 @@ kind=sh
 path=svc/knobd.sh
 uid=root
 mode=restart
+
+[service.1]
+name=adbgated
+kind=sh
+path=svc/adbgated.sh
+uid=root
+mode=restart

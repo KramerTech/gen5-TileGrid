@@ -30,9 +30,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -45,6 +43,8 @@ public final class MainActivity extends Activity implements TileGrid.Listener, T
     private static final String NEMESIS_COMPONENT = "com.nemesis.manager/.MainActivity";
     /** Root-side half of "turn on the Wi-Fi client", shipped in the NEMESIS package. */
     private static final String WIFI_CLIENT_SCRIPT = "/data/nemesis/apps/tilepad/bin/wifi-client.sh";
+    /** Reads the ADB relay daemon's status and flips its on/off flag; shipped in the package. */
+    private static final String ADB_TILE_SCRIPT = "/data/nemesis/apps/tilepad/bin/adb-tile.sh";
     private static final String WIFI_CLIENT_XML = "/system/etc/permissions/android.hardware.wifi.xml";
     private static final int KEY_TUNE_UP = keyCode("KEYCODE_TUNE_UP", 223);
     private static final int KEY_TUNE_DOWN = keyCode("KEYCODE_TUNE_DOWN", 224);
@@ -62,10 +62,18 @@ public final class MainActivity extends Activity implements TileGrid.Listener, T
     private TileSupport support;
     private WifiTile wifiTile;
     private PreconTile preconTile;
+    private AdbTile adbTile;
     private boolean preview, resumed, started, receiverRegistered, connectionReading, enterDown, enterLong;
     private long resumedAt, enterAt;
-    private int connectionEpoch, sheetKnob = -1;
+    private int connectionEpoch, adbEpoch, sheetKnob = -1;
     private ConnectionSnapshot connection = ConnectionSnapshot.unknown();
+
+    private AdbSnapshot adb = AdbSnapshot.checking();
+    private boolean adbReading, adbPendingOn;
+    /** While a toggle is in flight, holds the Starting/Stopping display until the daemon catches up. */
+    private long adbPendingSince;
+    /** The ADB popup, while it is the sheet on screen. */
+    private StatusCard adbCard;
 
     private PreconditioningService.LocalBinder vehicleService;
     private boolean vehicleBound;
@@ -100,6 +108,14 @@ public final class MainActivity extends Activity implements TileGrid.Listener, T
             main.removeCallbacks(this);
             if (!resumed) return;
             refreshConnection();
+            main.postDelayed(this, 3000);
+        }
+    };
+    private final Runnable adbTick = new Runnable() {
+        @Override public void run() {
+            main.removeCallbacks(this);
+            if (!resumed) return;
+            refreshAdb();
             main.postDelayed(this, 3000);
         }
     };
@@ -179,13 +195,16 @@ public final class MainActivity extends Activity implements TileGrid.Listener, T
         }
         refreshAvailability();
         if (support.precondition) preconTick.run();
+        adbTick.run();
     }
 
     @Override protected void onPause() {
         resumed = false;
         connectionEpoch++;
+        adbEpoch++;
         main.removeCallbacks(connectionTick);
         main.removeCallbacks(preconTick);
+        main.removeCallbacks(adbTick);
         if (receiverRegistered) { unregisterReceiver(wifiChanges); receiverRegistered = false; }
         super.onPause();
     }
@@ -216,6 +235,7 @@ public final class MainActivity extends Activity implements TileGrid.Listener, T
     private void rebuildTiles() {
         wifiTile = null;
         preconTile = null;
+        adbTile = null;
         List<TileView> views = new ArrayList<>();
         // Unsupported core tiles stay in the saved order, just not on the grid.
         for (TileSpec spec : specs) if (support.shows(spec.kind)) views.add(createTile(spec));
@@ -230,6 +250,10 @@ public final class MainActivity extends Activity implements TileGrid.Listener, T
                 tile = wifiTile = new WifiTile(ui, spec, this);
                 if (support.wifiClient) wifiTile.bind(connection);
                 else wifiTile.bindClientOff(wifiClientPending());
+                break;
+            case ADB:
+                tile = adbTile = new AdbTile(ui, spec, this);
+                adbTile.bind(adb);
                 break;
             case PRECONDITION:
                 tile = preconTile = new PreconTile(ui, spec, this);
@@ -287,6 +311,7 @@ public final class MainActivity extends Activity implements TileGrid.Listener, T
                 if (!support.wifiClient) { offerWifiClient(); return; }
                 launch(intentFor(spec), titleOf(tile));
                 return;
+            case ADB: onAdbTap(); return;
             case PRECONDITION: onPreconTap(); return;
             case REBOOT: confirmReboot(); return;
             case ADD: openAddPage(); return;
@@ -723,8 +748,7 @@ public final class MainActivity extends Activity implements TileGrid.Listener, T
                         WifiInfo info = manager.getConnectionInfo();
                         value = ConnectionSnapshot.read(manager.isWifiEnabled(),
                             info != null && info.getSupplicantState() == SupplicantState.COMPLETED,
-                            info == null ? null : info.getSSID(), info == null ? 0 : info.getIpAddress(),
-                            property("service.adb.tcp.port"), property("persist.adb.tcp.port"));
+                            info == null ? null : info.getSSID(), info == null ? 0 : info.getIpAddress());
                         if (info != null) value = value.withLink(WifiManager.calculateSignalLevel(info.getRssi(), 4), info.getLinkSpeed());
                     }
                 } catch (SecurityException e) { value = ConnectionSnapshot.unknown(); }
@@ -802,16 +826,151 @@ public final class MainActivity extends Activity implements TileGrid.Listener, T
         if (wifiTile != null) wifiTile.bind(value);
     }
 
-    private static String property(String name) {
-        try {
-            Process process = new ProcessBuilder("/system/bin/getprop", name).start();
-            String value;
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                value = reader.readLine();
+    // ---- ADB ----
+
+    private void refreshAdb() {
+        if (adbTile == null || adbReading) return;
+        if (preview) { onAdb(PreviewData.adb()); return; }
+        if (!RootShell.available()) { onAdb(AdbSnapshot.of(AdbSnapshot.State.OFF, 0, 0, 0, "Needs NEMESIS")); return; }
+        adbReading = true;
+        final int epoch = adbEpoch;
+        new Thread(new Runnable() {
+            @Override public void run() {
+                RootShell.Result r = RootShell.run("sh " + ADB_TILE_SCRIPT + " status");
+                final AdbSnapshot value = r.code == 0 ? AdbSnapshot.parse(r.output)
+                    : AdbSnapshot.of(AdbSnapshot.State.OFF, 0, 0, 0, "");
+                main.post(new Runnable() { @Override public void run() {
+                    adbReading = false;
+                    if (!isFinishing() && resumed && epoch == adbEpoch) onAdb(value);
+                } });
             }
-            process.waitFor();
-            return value == null ? "" : value;
-        } catch (Exception e) { return ""; }
+        }, "tilepad-adb").start();
+    }
+
+    private void onAdb(AdbSnapshot value) {
+        // Keep the optimistic Starting/Stopping display until the daemon settles, so a stale
+        // read during a toggle doesn't flicker the tile back.
+        if (adbPendingSince > 0) {
+            boolean settled = adbPendingOn ? value.state == AdbSnapshot.State.ON
+                                           : value.state == AdbSnapshot.State.OFF;
+            if (value.state == AdbSnapshot.State.ERROR || settled) adbPendingSince = 0;
+            else if (SystemClock.uptimeMillis() - adbPendingSince < 12000) {
+                value = AdbSnapshot.of(adbPendingOn ? AdbSnapshot.State.STARTING : AdbSnapshot.State.STOPPING,
+                    value.port, value.clients, value.allowed, value.detail);
+            } else {
+                adbPendingSince = 0; // give up waiting; show whatever the daemon reports
+            }
+        }
+        adb = value;
+        if (adbTile != null) adbTile.bind(value);
+        if (adbCard != null) renderAdbCard();
+    }
+
+    private void onAdbTap() {
+        final StatusCard card = new StatusCard(ui);
+        sheet.show(card, 720, new Runnable() {
+            @Override public void run() { if (adbCard == card) adbCard = null; }
+        });
+        adbCard = card;
+        renderAdbCard();
+    }
+
+    private void renderAdbCard() {
+        final StatusCard card = adbCard;
+        if (card == null) return;
+        AdbSnapshot s = adb;
+        StatusCard.Action close = new StatusCard.Action("Close", Ui.SURFACE, dismiss());
+        List<View> buttons;
+        switch (s.state) {
+            case ON: {
+                String computers = s.allowed == 1 ? "1 computer has connected" : s.allowed + " computers have connected";
+                card.set(Glyph.Kind.BUG, Ui.GREEN, false, "ADB is on",
+                    "Any computer on this Wi-Fi network can connect with “adb connect " + adbAddress(s.port)
+                        + "” and gets a shell — no key approval. Wi-Fi stays on, so wireless CarPlay and "
+                        + "Android Auto are off. Turn it off when you're done.",
+                    s.allowed > 0 ? computers : null);
+                buttons = card.setActions(close,
+                    new StatusCard.Action("Turn off", Ui.RED, new Runnable() { @Override public void run() { toggleAdb(false); } }));
+                break;
+            }
+            case KEYS:
+                card.set(Glyph.Kind.BUG, Ui.AMBER, false, "ADB is on, approved computers only",
+                    "Something other than this tile turned on ADB over Wi-Fi (“adb connect " + adbAddress(s.port)
+                        + "”). Only computers whose keys were approved before can connect.",
+                    "Allow all lets every computer in and keeps Wi-Fi on (wireless CarPlay off).");
+                buttons = card.setActions(close,
+                    new StatusCard.Action("Turn off", Ui.RED, new Runnable() { @Override public void run() { toggleAdb(false); } }),
+                    new StatusCard.Action("Allow all", Ui.ACCENT, new Runnable() { @Override public void run() { toggleAdb(true); } }));
+                break;
+            case STARTING:
+                card.set(null, Ui.AMBER, true, "Turning on ADB",
+                    "Opening the ADB port to every computer and turning on Wi-Fi.", null);
+                buttons = card.setActions(close);
+                break;
+            case STOPPING:
+                card.set(null, Ui.MUTED, true, "Turning off ADB",
+                    "Stopping ADB, removing the keys it added, and turning Wi-Fi back off if ADB turned it on.", null);
+                buttons = card.setActions(close);
+                break;
+            case ERROR:
+                card.set(Glyph.Kind.ALERT, Ui.RED, false, "ADB error",
+                    s.detail.isEmpty() ? "The relay reported a problem." : s.detail, null);
+                buttons = card.setActions(close, adbTurnOn());
+                break;
+            case CHECKING:
+                card.set(null, Ui.MUTED, true, "Checking ADB", "Reading the current state.", null);
+                buttons = card.setActions(close);
+                break;
+            default: // OFF
+                if (!RootShell.available()) {
+                    card.set(Glyph.Kind.ALERT, Ui.AMBER, false, "ADB unavailable",
+                        "Turning ADB on needs NEMESIS, which isn't installed on this head unit.", null);
+                    buttons = card.setActions(close);
+                } else {
+                    card.set(Glyph.Kind.BUG, Ui.AMBER, false, "Turn on ADB?",
+                        "This opens ADB over Wi-Fi and lets every computer on the network connect without approving a key "
+                            + "— anyone on the same network gets a root-capable shell. It also turns on Wi-Fi and keeps it "
+                            + "on, at every boot too, which shuts off the hotspot wireless CarPlay and Android Auto use. "
+                            + "Turn it off when you're done.",
+                        wifiClientPending() ? "Off closes ADB completely and turns off the Wi-Fi it turned on."
+                            : "This head unit's Wi-Fi only runs the CarPlay hotspot: turn on Wi-Fi from the Wi-Fi tile first.");
+                    buttons = card.setActions(close, adbTurnOn());
+                }
+        }
+        if (!buttons.equals(sheet.targets())) sheet.setTargets(buttons);
+    }
+
+    private StatusCard.Action adbTurnOn() {
+        return new StatusCard.Action("Turn on", Ui.ACCENT, new Runnable() { @Override public void run() { toggleAdb(true); } });
+    }
+
+    private String adbAddress(int port) {
+        String host = connection.state == ConnectionSnapshot.State.CONNECTED ? connection.ip : "<ip>";
+        return host + ":" + (port > 0 ? port : 5555);
+    }
+
+    private void toggleAdb(final boolean on) {
+        adbPendingSince = SystemClock.uptimeMillis();
+        adbPendingOn = on;
+        adb = AdbSnapshot.of(on ? AdbSnapshot.State.STARTING : AdbSnapshot.State.STOPPING,
+            adb.port, adb.clients, adb.allowed, "");
+        if (adbTile != null) adbTile.bind(adb);
+        if (adbCard != null) renderAdbCard();
+        final int epoch = adbEpoch;
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final RootShell.Result r = RootShell.run("sh " + ADB_TILE_SCRIPT + " " + (on ? "on" : "off"));
+                main.post(new Runnable() { @Override public void run() {
+                    if (isFinishing() || !resumed || epoch != adbEpoch) return;
+                    if (r.code != 0) {
+                        adbPendingSince = 0;
+                        onAdb(AdbSnapshot.error(r.output.isEmpty() ? "nemesis exited with code " + r.code : r.output));
+                    } else {
+                        refreshAdb();
+                    }
+                } });
+            }
+        }, "tilepad-adb-toggle").start();
     }
 
     // ---- TUNE knob ----

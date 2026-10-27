@@ -6,7 +6,7 @@ package com.tilepad;
  */
 final class WifiTile extends StatusTile {
     WifiTile(Ui ui, TileSpec spec, EditListener edits) {
-        super(ui, spec, edits, Glyph.Kind.WIFI, null);
+        super(ui, spec, edits, Glyph.Kind.WIFI, "Wi-Fi Client");
         bind(ConnectionSnapshot.unknown());
     }
 
@@ -19,9 +19,7 @@ final class WifiTile extends StatusTile {
                 setPill("Connected", Ui.GREEN);
                 show(headline, c.network);
                 show(detail, c.ip);
-                String speed = c.linkMbps > 0 ? c.linkMbps + " Mbps" : "";
-                String adb = c.adbPort().isEmpty() ? "" : "ADB " + c.adbPort();
-                show(meta, speed.isEmpty() || adb.isEmpty() ? speed + adb : speed + " · " + adb);
+                show(meta, c.linkMbps > 0 ? c.linkMbps + " Mbps" : "");
                 setContentDescription("Wi-Fi connected to " + c.network + ", " + c.ip);
                 break;
             }
@@ -30,25 +28,25 @@ final class WifiTile extends StatusTile {
                 glyph.setColor(Ui.MUTED); glyph.setSignal(0);
                 setPill("No network", Ui.AMBER);
                 show(headline, "Not connected");
-                show(detail, "Tap to choose");
-                show(meta, "");
+                show(detail, "");
+                show(meta, "Tap to choose a network");
                 setContentDescription("Wi-Fi not connected");
                 break;
             case OFF:
                 glyph.setKind(Glyph.Kind.WIFI_OFF);
                 glyph.setColor(Ui.MUTED); glyph.setSignal(0);
                 setPill("Off", Ui.MUTED);
-                show(headline, "Wi-Fi off");
-                show(detail, "Tap to open settings");
-                show(meta, "");
+                show(headline, "Off");
+                show(detail, "");
+                show(meta, "Tap to open settings");
                 setContentDescription("Wi-Fi off");
                 break;
             default:
                 glyph.setKind(Glyph.Kind.WIFI);
                 glyph.setColor(Ui.MUTED); glyph.setSignal(0);
                 setPill(null, Ui.MUTED);
-                show(headline, "Wi-Fi");
-                show(detail, "Checking…");
+                show(headline, "Checking…");
+                show(detail, "");
                 show(meta, "");
                 setContentDescription("Wi-Fi");
         }
@@ -59,9 +57,9 @@ final class WifiTile extends StatusTile {
         glyph.setKind(Glyph.Kind.WIFI_OFF);
         glyph.setColor(Ui.MUTED); glyph.setSignal(0);
         setPill(pendingReboot ? "Reboot" : "Client off", pendingReboot ? Ui.AMBER : Ui.MUTED);
-        show(headline, pendingReboot ? "Wi-Fi client on" : "Hotspot only");
-        show(detail, pendingReboot ? "Reboot to finish" : "Tap to turn on Wi-Fi");
-        show(meta, "");
+        show(headline, pendingReboot ? "Turned on" : "Hotspot only");
+        show(detail, "");
+        show(meta, pendingReboot ? "Reboot to finish" : "Tap to turn on Wi-Fi");
         setContentDescription(pendingReboot ? "Wi-Fi client on, reboot to finish" : "Wi-Fi client off");
     }
 }

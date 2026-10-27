@@ -12,7 +12,7 @@ import android.graphics.drawable.Drawable;
 /** Outline icons drawn on a 24-unit grid with a 2-unit round stroke, tintable by color. */
 final class Glyph extends Drawable {
     enum Kind {
-        WIFI, WIFI_OFF, BATTERY_HEAT, TERMINAL, CAR, REBOOT, PLUS, MINUS, PENCIL, SEARCH, BACK,
+        WIFI, WIFI_OFF, BATTERY_HEAT, TERMINAL, BUG, CAR, REBOOT, PLUS, MINUS, PENCIL, SEARCH, BACK,
         BACKSPACE, CHECK, CLOSE, ALERT, CHEVRON_DOWN, SHIFT, APPS
     }
 
@@ -83,6 +83,20 @@ final class Glyph extends Drawable {
                 rect(canvas, 2.5f, 4f, 21.5f, 20f, 3f);
                 poly(canvas, false, 7f, 9.5f, 10f, 12f, 7f, 14.5f);
                 canvas.drawLine(12.5f, 14.5f, 17f, 14.5f, stroke);
+                break;
+            case BUG:
+                oval.set(9f, 4.5f, 15f, 10.5f);
+                canvas.drawArc(oval, 180f, 180f, false, stroke);
+                canvas.drawLine(10f, 5.3f, 8.5f, 3f, stroke);
+                canvas.drawLine(14f, 5.3f, 15.5f, 3f, stroke);
+                rect(canvas, 7f, 9f, 17f, 21f, 5f);
+                canvas.drawLine(12f, 12.5f, 12f, 18.5f, stroke);
+                // Legs: out and up, straight out, out and down, mirrored.
+                float[] legs = {12f, 10.5f, 15.5f, 15.5f, 19f, 20.5f};
+                for (int i = 0; i < legs.length; i += 2) {
+                    canvas.drawLine(7f, legs[i], 3.5f, legs[i + 1], stroke);
+                    canvas.drawLine(17f, legs[i], 20.5f, legs[i + 1], stroke);
+                }
                 break;
             case CAR:
                 poly(canvas, false, 5.5f, 10.5f, 7.4f, 6f, 16.6f, 6f, 18.5f, 10.5f);

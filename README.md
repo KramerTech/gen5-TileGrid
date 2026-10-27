@@ -12,6 +12,7 @@ Hold **TUNE** for about a second to open it. Hold again to close it.
 - **Wi-Fi status** (if the head unit has a Wi-Fi module): network, IP, signal. Tap to pick a network.
   On a unit whose Wi-Fi only runs the CarPlay/Android Auto hotspot, tap to turn on the Wi-Fi client.
 - **Manual battery preconditioning** (if available on the vehicle): one-tap start and stop.
+- **ADB toggle**: turn ADB over Wi-Fi on and off. While it's on, any computer on the network can connect without approving a key, and Wi-Fi stays on (so wireless CarPlay/Android Auto are off).
 - **NEMESIS Manager** shortcut.
 - **Car Home**: back to Hyundai's home screen.
 - **Reboot** the head unit, with confirmation.
@@ -29,8 +30,9 @@ nothing, because of Launchpad's firmware gate.
 
 | Tile | Shows | Tap |
 | --- | --- | --- |
-| **Wi-Fi** *(Wi-Fi module only)* | signal bars, Connected / No network / Off, network name, IP, link speed, ADB port if advertised. *Hotspot only* when the client is off | Android's Wi-Fi network picker, or *turn on Wi-Fi* (see below) |
+| **Wi-Fi** *(Wi-Fi module only)* | signal bars, Connected / No network / Off, network name, IP, link speed. *Hotspot only* when the client is off | Android's Wi-Fi network picker, or *turn on Wi-Fi* (see below) |
 | **Precondition** *(EVs only)* | Off / Waiting / Active / Unavailable…, spinner while waiting, elapsed time, a *Conditioning* pill while the car's own indicator is on | see below |
+| **ADB** | On / Off, the port, and how many computers are connected; an *Allow all* pill while it's on, *Keys only* if something else turned ADB on | asks to confirm, then turns ADB over Wi-Fi on or off (see below) |
 | **NEMESIS** | | NEMESIS Manager (dimmed if it's not installed) |
 | **Car Home** | | closes to Hyundai's home screen |
 | **Reboot** | | asks to confirm, then hard-reboots the head unit (`nemesis root -c reboot`) |
@@ -62,6 +64,54 @@ reboot, since Android reads features at boot. Until then, the tile reads *Reboot
 - There's one Wi-Fi radio. While it's on a network, wireless CarPlay/Android Auto may not connect.
 - Uninstalling Tilepad leaves the client on (the uninstall log says so). To turn it off, delete
   that file and reboot.
+
+**ADB over Wi-Fi.** The ADB tile turns ADB over Wi-Fi on and off. Tapping it when it's off asks
+to confirm, because of what "on" means:
+
+> ⚠️ While ADB is on, **any computer on the same Wi-Fi network can connect and get a
+> root-capable shell**, with no key to approve on the head unit. Every computer's key is logged
+> and saved, but nobody is turned away. Only turn it on on a network you trust, and turn it off
+> when you're done.
+
+> ⚠️ While ADB is on, **wireless CarPlay and Android Auto don't work.** The head unit has one
+> Wi-Fi radio: it either joins a network or runs the hotspot your phone uses for wireless
+> CarPlay, not both. ADB turns on Wi-Fi and keeps it on (turning the hotspot off), right away and
+> again at every boot, until you turn ADB off.
+
+- **Why a relay.** There's no "Allow USB debugging?" dialog on these head units. Turning the tile
+  on starts a small relay (a NEMESIS service) that moves adbd to an internal port, listens on the
+  normal one, and handles each computer's key before passing the connection to adbd. Connect
+  with `adb connect <head-unit-ip>:5555`.
+  - Some units' adbd doesn't check keys over TCP at all (despite `ro.adb.secure=1`). There the
+    relay checks them itself, and every computer gets in on its first `adb connect`.
+  - Where adbd does check keys, the relay adds a new computer's key to `adb_keys` and drops that
+    first connection, so **a new computer's first `adb connect` fails once, and the next one
+    works.**
+
+  The head unit serves **one computer at a time**: while one is connected, another's
+  `adb connect` hangs and shows `offline` or `unauthorized` until the first disconnects
+  (`adb disconnect`).
+
+  Either way, the relay logs each computer (address, key name and fingerprint) to the service
+  log (`adbgated.log`) and saves each new key to `/data/nemesis/backup/tilepad/adb/keys`, which
+  stays when you turn ADB off.
+- **Wi-Fi only.** The relay refuses connections that don't arrive over Wi-Fi (the car's
+  telematics modem has cellular links up too), and a firewall rule keeps everything but the
+  relay off adbd's internal port.
+- **Wi-Fi.** ADB needs the head unit on the same network as your computer, so while ADB is on it
+  keeps Wi-Fi on and joined to your saved network, at every boot too. On a unit whose Wi-Fi only
+  runs the CarPlay hotspot, turn on Wi-Fi from the Wi-Fi tile first.
+- **Turning it off** turns ADB over Wi-Fi off completely: nothing listens for ADB until you turn it
+  on again, after a reboot too. It also removes the keys the relay added, and turns Wi-Fi back off
+  if ADB was what turned it on, so wireless CarPlay works again.
+- If ADB over Wi-Fi was turned on some other way (another package, or a setting from before), the
+  tile says *Keys only*: only computers approved before can connect. Tap it to turn ADB off, or to
+  allow all.
+- The tile shows how many computers (keys) have connected, and a spinner while it's starting or
+  stopping.
+- It needs NEMESIS (for root); without it the tile says so and does nothing.
+- An **update** keeps ADB in whatever state you left it. **Uninstalling** Tilepad turns it off if
+  the tile had it on (and turns off the Wi-Fi it turned on).
 
 **Arranging:**
 - Long-press any tile, then drag it. Tiles wiggle while you're in edit mode.

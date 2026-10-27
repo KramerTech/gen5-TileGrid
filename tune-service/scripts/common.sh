@@ -18,6 +18,11 @@ WORK=/data/local/tmp/tilepad
 # uninstall hooks, so its presence during preuninstall means "update".
 STAGE=/data/local/tmp/nemesis/stage/tilepad
 APP_PACKAGE=com.tilepad
+# State dir for the ADB relay (svc/adbgated.sh, bin/adb-tile.sh): the on flag, the off request,
+# the daemon's status file and its list of every key that has connected (keys). It lives outside the package dir, so the relay stays on across an
+# update; a real uninstall turns it off. (The keys the relay adds, and its ledger of them,
+# live in /data/misc/adb next to adb_keys, where uid 1000 can write them.)
+ADB_SNAP=/data/nemesis/backup/tilepad/adb
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') tilepad $*"; }
 

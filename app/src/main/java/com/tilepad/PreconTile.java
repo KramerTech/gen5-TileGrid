@@ -16,8 +16,8 @@ final class PreconTile extends StatusTile {
         boolean off = (s.state == PreconditioningSnapshot.State.IDLE
             || s.state == PreconditioningSnapshot.State.ENDED) && s.indicator != 1;
         headline.setTextColor(off ? Ui.TEXT : color);
-        show(detail, "");
-        show(meta, PreconPresenter.footer(s));
+        show(detail, PreconPresenter.detail(s));
+        show(meta, PreconPresenter.hint(s));
         String indicator = PreconPresenter.indicator(s);
         setPill(indicator, s.indicator == 1 ? Ui.GREEN : Ui.MUTED);
         setContentDescription("Battery preconditioning, " + s.title() + ". " + s.detail);
