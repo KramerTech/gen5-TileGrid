@@ -34,7 +34,8 @@ public class PreconPresenterTest {
         assertEquals("Tap for details", PreconPresenter.footer(snap(PreconditioningSnapshot.State.UNAVAILABLE, false, false, false, 0)));
         assertEquals("Off", PreconPresenter.headline(snap(PreconditioningSnapshot.State.ENDED, false, true, false, 0)));
         assertNull(PreconPresenter.indicator(snap(PreconditioningSnapshot.State.CHECKING, false, false, false, -1)));
-        assertEquals("Car off", PreconPresenter.indicator(snap(PreconditioningSnapshot.State.IDLE, false, true, false, 0)));
+        assertNull(PreconPresenter.indicator(snap(PreconditioningSnapshot.State.IDLE, false, true, false, 0)));
+        assertEquals("Conditioning", PreconPresenter.indicator(snap(PreconditioningSnapshot.State.ACTIVE, true, false, true, 1)));
     }
     @Test public void waitingDetailDropsTheRepeatedTitle() {
         assertEquals("Activation may take about 1–2 minutes.",

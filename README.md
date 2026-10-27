@@ -30,7 +30,7 @@ nothing, because of Launchpad's firmware gate.
 | Tile | Shows | Tap |
 | --- | --- | --- |
 | **Wi-Fi** *(Wi-Fi module only)* | signal bars, Connected / No network / Off, network name, IP, link speed, ADB port if advertised. *Hotspot only* when the client is off | Android's Wi-Fi network picker, or *turn on Wi-Fi* (see below) |
-| **Precondition** *(EVs only)* | Off / Waiting / Active / Unavailable…, spinner while waiting, elapsed time, the car's own indicator (Car on/off) | see below |
+| **Precondition** *(EVs only)* | Off / Waiting / Active / Unavailable…, spinner while waiting, elapsed time, a *Conditioning* pill while the car's own indicator is on | see below |
 | **NEMESIS** | | NEMESIS Manager (dimmed if it's not installed) |
 | **Car Home** | | closes to Hyundai's home screen |
 | **Reboot** | | asks to confirm, then hard-reboots the head unit (`nemesis root -c reboot`) |

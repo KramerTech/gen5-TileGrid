@@ -59,9 +59,12 @@ final class PreconPresenter {
         }
     }
 
-    /** The car's own conditioning indicator, for the tile's status pill; null when unknown. */
+    /**
+     * The car's own conditioning indicator, for the tile's status pill; null unless it's on.
+     * An off indicator gets no pill: "Car off" read as the car itself being off.
+     */
     static String indicator(PreconditioningSnapshot s) {
-        return s.indicator == 1 ? "Car on" : s.indicator == 0 ? "Car off" : null;
+        return s.indicator == 1 ? "Conditioning" : null;
     }
 
     /** "Waiting for BMS — activation may…" under a "Waiting for BMS" title reads "Activation may…". */
